@@ -257,6 +257,41 @@ void test_persistence(void) {
     PASS();
 }
 
+void test_free_list_reuse(void) {
+    TEST("Free list reuses deleted pages");
+
+    const char *path = "test_freelist.db";
+    unlink(path);
+
+    struct db *db = db_open(path);
+    ASSERT(db != NULL, "Failed to open database");
+
+    db_put(db, (uint8_t *)"key1", 4, (uint8_t *)"val1", 4);
+    db_put(db, (uint8_t *)"key2", 4, (uint8_t *)"val2", 4);
+    db_put(db, (uint8_t *)"key3", 4, (uint8_t *)"val3", 4);
+
+    uint64_t pages_before = db->header.next_free_page;
+
+    db_delete(db, (uint8_t *)"key2", 4);
+
+    db_put(db, (uint8_t *)"key4", 4, (uint8_t *)"val4", 4);
+
+    uint64_t pages_after = db->header.next_free_page;
+
+    ASSERT(pages_before == pages_after, "Should reuse deleted page");
+
+    uint32_t val_len;
+    uint8_t *val = db_get(db, (uint8_t *)"key4", 4, &val_len);
+    ASSERT(val != NULL, "Should retrieve reused page data");
+    ASSERT(memcmp(val, "val4", 4) == 0, "Reused page data mismatch");
+
+    free(val);
+    db_close(db);
+    unlink(path);
+
+    PASS();
+}
+
 int main(void) {
     printf("=== KVStore Test Suite ===\n\n");
 
@@ -270,6 +305,7 @@ int main(void) {
     test_put_overwrite();
     test_delete();
     test_persistence();
+    test_free_list_reuse();
 
     printf("\n=== Results ===\n");
     printf(GREEN "Passed: %d" RESET "\n", tests_passed);

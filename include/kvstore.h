@@ -20,7 +20,8 @@ struct db_header {
     uint32_t page_size;
     uint32_t num_pages;
     uint64_t next_free_page;
-    uint8_t reserved[4072];
+    uint64_t free_list_head;
+    uint8_t reserved[4064];
 } __attribute__((packed));
 
 struct page_header {

@@ -1,0 +1,47 @@
+# Build artifacts
+build/
+*.o
+*.a
+*.so
+*.dylib
+
+# Test databases
+*.db
+test_*.db
+
+# Executables
+test_kvstore
+kvstore
+
+# IDE and editor files
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# API keys and secrets
+.env
+.env.*
+!.env.example
+*.key
+*.pem
+secrets.json
+credentials.json
+
+# MCP config (contains API keys)
+.mcp.json
+
+# Logs
+*.log
+
+# Core dumps
+core
+core.*
+vgcore.*
+
+# Temporary files
+tmp/
+temp/
+*.tmp

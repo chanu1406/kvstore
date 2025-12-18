@@ -20,6 +20,7 @@ static int init_new_db(int fd) {
     header.page_size = PAGE_SIZE;
     header.num_pages = 1;
     header.next_free_page = 1;
+    header.free_list_head = 0;
 
     ssize_t written = pwrite(fd, &header, sizeof(header), 0);
     if (written != sizeof(header)) {
@@ -56,6 +57,51 @@ static int read_header(int fd, struct db_header *header) {
         return -1;
     }
 
+    return 0;
+}
+
+static uint64_t alloc_page(struct db *db) {
+    if (db->header.free_list_head != 0) {
+        uint64_t page_num = db->header.free_list_head;
+
+        uint8_t page_buf[PAGE_SIZE];
+        off_t offset = page_num * PAGE_SIZE;
+        ssize_t bytes_read = pread(db->fd, page_buf, PAGE_SIZE, offset);
+
+        if (bytes_read != PAGE_SIZE) {
+            return 0;
+        }
+
+        struct page_header *ph = (struct page_header *)page_buf;
+        db->header.free_list_head = ph->reserved;
+
+        return page_num;
+    }
+
+    uint64_t page_num = db->header.next_free_page;
+    db->header.next_free_page++;
+    db->header.num_pages++;
+    return page_num;
+}
+
+static int free_page(struct db *db, uint64_t page_num) {
+    uint8_t page_buf[PAGE_SIZE];
+    memset(page_buf, 0, PAGE_SIZE);
+
+    struct page_header *ph = (struct page_header *)page_buf;
+    ph->page_type = PAGE_TYPE_DELETED;
+    ph->checksum = 0;
+    ph->reserved = db->header.free_list_head;
+
+    off_t offset = page_num * PAGE_SIZE;
+    ssize_t written = pwrite(db->fd, page_buf, PAGE_SIZE, offset);
+
+    if (written != PAGE_SIZE) {
+        errno = EIO;
+        return -1;
+    }
+
+    db->header.free_list_head = page_num;
     return 0;
 }
 
@@ -138,10 +184,10 @@ int db_put(struct db *db, const uint8_t *key, uint32_t key_len,
     }
 
     uint8_t page_buf[PAGE_SIZE];
-    uint64_t page_num;
+    uint64_t old_page_num = 0;
     int found = 0;
 
-    for (page_num = 1; page_num < db->header.next_free_page; page_num++) {
+    for (uint64_t page_num = 1; page_num < db->header.next_free_page; page_num++) {
         off_t offset = page_num * PAGE_SIZE;
         ssize_t bytes_read = pread(db->fd, page_buf, PAGE_SIZE, offset);
 
@@ -162,14 +208,19 @@ int db_put(struct db *db, const uint8_t *key, uint32_t key_len,
 
         if (stored_key_len == key_len && memcmp(p, key, key_len) == 0) {
             found = 1;
+            old_page_num = page_num;
             break;
         }
     }
 
-    if (!found) {
-        page_num = db->header.next_free_page;
-        db->header.next_free_page++;
-        db->header.num_pages++;
+    uint64_t new_page_num = alloc_page(db);
+    if (new_page_num == 0) {
+        errno = EIO;
+        return -1;
+    }
+
+    if (found) {
+        free_page(db, old_page_num);
     }
 
     memset(page_buf, 0, PAGE_SIZE);
@@ -188,7 +239,7 @@ int db_put(struct db *db, const uint8_t *key, uint32_t key_len,
     p += sizeof(uint32_t);
     memcpy(p, val, val_len);
 
-    off_t offset = page_num * PAGE_SIZE;
+    off_t offset = new_page_num * PAGE_SIZE;
     ssize_t written = pwrite(db->fd, page_buf, PAGE_SIZE, offset);
 
     if (written != PAGE_SIZE) {
@@ -281,11 +332,7 @@ int db_delete(struct db *db, const uint8_t *key, uint32_t key_len) {
             continue;
         }
 
-        ph->page_type = PAGE_TYPE_DELETED;
-
-        ssize_t written = pwrite(db->fd, page_buf, PAGE_SIZE, offset);
-        if (written != PAGE_SIZE) {
-            errno = EIO;
+        if (free_page(db, page_num) != 0) {
             return -1;
         }
 
