@@ -30,12 +30,28 @@ struct page_header {
     uint64_t reserved;
 } __attribute__((packed));
 
+/* Hash table for in-memory indexing */
+
+#define HASH_TABLE_SIZE 1024
+
+struct hash_entry {
+    uint8_t *key;
+    uint32_t key_len;
+    uint64_t page_num;
+    struct hash_entry *next;
+};
+
+struct hash_table {
+    struct hash_entry *buckets[HASH_TABLE_SIZE];
+};
+
 /* Runtime handle */
 
 struct db {
     int fd;
     struct db_header header;
     char *filepath;
+    struct hash_table *index;
 };
 
 /* API */

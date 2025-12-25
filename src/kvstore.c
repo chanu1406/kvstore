@@ -105,6 +105,93 @@ static int free_page(struct db *db, uint64_t page_num) {
     return 0;
 }
 
+static uint32_t hash_key(const uint8_t *key, uint32_t key_len) {
+    uint32_t hash = 5381;
+    for (uint32_t i = 0; i < key_len; i++) {
+        hash = ((hash << 5) + hash) + key[i];
+    }
+    return hash % HASH_TABLE_SIZE;
+}
+
+static struct hash_table *hash_table_create(void) {
+    struct hash_table *ht = calloc(1, sizeof(*ht));
+    return ht;
+}
+
+static void hash_table_insert(struct hash_table *ht, const uint8_t *key,
+                              uint32_t key_len, uint64_t page_num) {
+    if (!ht) return;
+
+    uint32_t bucket = hash_key(key, key_len);
+
+    struct hash_entry *entry = malloc(sizeof(*entry));
+    if (!entry) return;
+
+    entry->key = malloc(key_len);
+    if (!entry->key) {
+        free(entry);
+        return;
+    }
+
+    memcpy(entry->key, key, key_len);
+    entry->key_len = key_len;
+    entry->page_num = page_num;
+    entry->next = ht->buckets[bucket];
+    ht->buckets[bucket] = entry;
+}
+
+static uint64_t hash_table_lookup(struct hash_table *ht, const uint8_t *key,
+                                   uint32_t key_len) {
+    if (!ht) return 0;
+
+    uint32_t bucket = hash_key(key, key_len);
+    struct hash_entry *entry = ht->buckets[bucket];
+
+    while (entry) {
+        if (entry->key_len == key_len && memcmp(entry->key, key, key_len) == 0) {
+            return entry->page_num;
+        }
+        entry = entry->next;
+    }
+
+    return 0;
+}
+
+static void hash_table_remove(struct hash_table *ht, const uint8_t *key,
+                               uint32_t key_len) {
+    if (!ht) return;
+
+    uint32_t bucket = hash_key(key, key_len);
+    struct hash_entry **entry_ptr = &ht->buckets[bucket];
+
+    while (*entry_ptr) {
+        struct hash_entry *entry = *entry_ptr;
+        if (entry->key_len == key_len && memcmp(entry->key, key, key_len) == 0) {
+            *entry_ptr = entry->next;
+            free(entry->key);
+            free(entry);
+            return;
+        }
+        entry_ptr = &entry->next;
+    }
+}
+
+static void hash_table_destroy(struct hash_table *ht) {
+    if (!ht) return;
+
+    for (int i = 0; i < HASH_TABLE_SIZE; i++) {
+        struct hash_entry *entry = ht->buckets[i];
+        while (entry) {
+            struct hash_entry *next = entry->next;
+            free(entry->key);
+            free(entry);
+            entry = next;
+        }
+    }
+
+    free(ht);
+}
+
 struct db *db_open(const char *path) {
     if (!path) {
         errno = EINVAL;
@@ -153,6 +240,36 @@ struct db *db_open(const char *path) {
         return NULL;
     }
 
+    db->index = hash_table_create();
+    if (!db->index) {
+        close(db->fd);
+        free(db->filepath);
+        free(db);
+        return NULL;
+    }
+
+    uint8_t page_buf[PAGE_SIZE];
+    for (uint64_t page_num = 1; page_num < db->header.next_free_page; page_num++) {
+        off_t offset = page_num * PAGE_SIZE;
+        ssize_t bytes_read = pread(db->fd, page_buf, PAGE_SIZE, offset);
+
+        if (bytes_read != PAGE_SIZE) {
+            continue;
+        }
+
+        struct page_header *ph = (struct page_header *)page_buf;
+        if (ph->page_type != PAGE_TYPE_DATA) {
+            continue;
+        }
+
+        uint8_t *p = page_buf + sizeof(struct page_header);
+        uint32_t key_len;
+        memcpy(&key_len, p, sizeof(uint32_t));
+        p += sizeof(uint32_t);
+
+        hash_table_insert(db->index, p, key_len, page_num);
+    }
+
     return db;
 }
 
@@ -164,6 +281,7 @@ void db_close(struct db *db) {
     pwrite(db->fd, &db->header, sizeof(db->header), 0);
     fsync(db->fd);
     close(db->fd);
+    hash_table_destroy(db->index);
     free(db->filepath);
     free(db);
 }
@@ -183,35 +301,7 @@ int db_put(struct db *db, const uint8_t *key, uint32_t key_len,
         return -1;
     }
 
-    uint8_t page_buf[PAGE_SIZE];
-    uint64_t old_page_num = 0;
-    int found = 0;
-
-    for (uint64_t page_num = 1; page_num < db->header.next_free_page; page_num++) {
-        off_t offset = page_num * PAGE_SIZE;
-        ssize_t bytes_read = pread(db->fd, page_buf, PAGE_SIZE, offset);
-
-        if (bytes_read != PAGE_SIZE) {
-            errno = EIO;
-            return -1;
-        }
-
-        struct page_header *ph = (struct page_header *)page_buf;
-        if (ph->page_type != PAGE_TYPE_DATA) {
-            continue;
-        }
-
-        uint8_t *p = page_buf + sizeof(struct page_header);
-        uint32_t stored_key_len;
-        memcpy(&stored_key_len, p, sizeof(uint32_t));
-        p += sizeof(uint32_t);
-
-        if (stored_key_len == key_len && memcmp(p, key, key_len) == 0) {
-            found = 1;
-            old_page_num = page_num;
-            break;
-        }
-    }
+    uint64_t old_page_num = hash_table_lookup(db->index, key, key_len);
 
     uint64_t new_page_num = alloc_page(db);
     if (new_page_num == 0) {
@@ -219,10 +309,12 @@ int db_put(struct db *db, const uint8_t *key, uint32_t key_len,
         return -1;
     }
 
-    if (found) {
+    if (old_page_num != 0) {
+        hash_table_remove(db->index, key, key_len);
         free_page(db, old_page_num);
     }
 
+    uint8_t page_buf[PAGE_SIZE];
     memset(page_buf, 0, PAGE_SIZE);
 
     struct page_header *ph = (struct page_header *)page_buf;
@@ -247,6 +339,8 @@ int db_put(struct db *db, const uint8_t *key, uint32_t key_len,
         return -1;
     }
 
+    hash_table_insert(db->index, key, key_len, new_page_num);
+
     return 0;
 }
 
@@ -257,48 +351,36 @@ uint8_t *db_get(struct db *db, const uint8_t *key, uint32_t key_len,
         return NULL;
     }
 
-    uint8_t page_buf[PAGE_SIZE];
-
-    for (uint64_t page_num = 1; page_num < db->header.next_free_page; page_num++) {
-        off_t offset = page_num * PAGE_SIZE;
-        ssize_t bytes_read = pread(db->fd, page_buf, PAGE_SIZE, offset);
-
-        if (bytes_read != PAGE_SIZE) {
-            errno = EIO;
-            return NULL;
-        }
-
-        struct page_header *ph = (struct page_header *)page_buf;
-        if (ph->page_type != PAGE_TYPE_DATA) {
-            continue;
-        }
-
-        uint8_t *p = page_buf + sizeof(struct page_header);
-        uint32_t stored_key_len;
-        memcpy(&stored_key_len, p, sizeof(uint32_t));
-        p += sizeof(uint32_t);
-
-        if (stored_key_len != key_len || memcmp(p, key, key_len) != 0) {
-            continue;
-        }
-
-        p += key_len;
-        uint32_t val_len;
-        memcpy(&val_len, p, sizeof(uint32_t));
-        p += sizeof(uint32_t);
-
-        uint8_t *val = malloc(val_len);
-        if (!val) {
-            return NULL;
-        }
-
-        memcpy(val, p, val_len);
-        *val_len_out = val_len;
-        return val;
+    uint64_t page_num = hash_table_lookup(db->index, key, key_len);
+    if (page_num == 0) {
+        errno = ENOENT;
+        return NULL;
     }
 
-    errno = ENOENT;
-    return NULL;
+    uint8_t page_buf[PAGE_SIZE];
+    off_t offset = page_num * PAGE_SIZE;
+    ssize_t bytes_read = pread(db->fd, page_buf, PAGE_SIZE, offset);
+
+    if (bytes_read != PAGE_SIZE) {
+        errno = EIO;
+        return NULL;
+    }
+
+    uint8_t *p = page_buf + sizeof(struct page_header) + sizeof(uint32_t);
+    p += key_len;
+
+    uint32_t val_len;
+    memcpy(&val_len, p, sizeof(uint32_t));
+    p += sizeof(uint32_t);
+
+    uint8_t *val = malloc(val_len);
+    if (!val) {
+        return NULL;
+    }
+
+    memcpy(val, p, val_len);
+    *val_len_out = val_len;
+    return val;
 }
 
 int db_delete(struct db *db, const uint8_t *key, uint32_t key_len) {
@@ -307,38 +389,17 @@ int db_delete(struct db *db, const uint8_t *key, uint32_t key_len) {
         return -1;
     }
 
-    uint8_t page_buf[PAGE_SIZE];
-
-    for (uint64_t page_num = 1; page_num < db->header.next_free_page; page_num++) {
-        off_t offset = page_num * PAGE_SIZE;
-        ssize_t bytes_read = pread(db->fd, page_buf, PAGE_SIZE, offset);
-
-        if (bytes_read != PAGE_SIZE) {
-            errno = EIO;
-            return -1;
-        }
-
-        struct page_header *ph = (struct page_header *)page_buf;
-        if (ph->page_type != PAGE_TYPE_DATA) {
-            continue;
-        }
-
-        uint8_t *p = page_buf + sizeof(struct page_header);
-        uint32_t stored_key_len;
-        memcpy(&stored_key_len, p, sizeof(uint32_t));
-        p += sizeof(uint32_t);
-
-        if (stored_key_len != key_len || memcmp(p, key, key_len) != 0) {
-            continue;
-        }
-
-        if (free_page(db, page_num) != 0) {
-            return -1;
-        }
-
-        return 0;
+    uint64_t page_num = hash_table_lookup(db->index, key, key_len);
+    if (page_num == 0) {
+        errno = ENOENT;
+        return -1;
     }
 
-    errno = ENOENT;
-    return -1;
+    if (free_page(db, page_num) != 0) {
+        return -1;
+    }
+
+    hash_table_remove(db->index, key, key_len);
+
+    return 0;
 }
